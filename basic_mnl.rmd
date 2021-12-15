@@ -1,0 +1,415 @@
+---
+title: "Multinomial Logit Model for basic MATSim model"
+author: "jafshin"
+date: "26/04/2021"
+output: 
+  html_document: 
+    highlight: textmate
+    theme: paper
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message= FALSE, comment=NA)
+
+library(tidyverse)
+library(data.table)
+library(sf)
+library(stringr)
+library(glue)
+library(lubridate)
+
+usingPreviousTransitData=F
+```
+
+## Input data: VISTA 2012-16
+
+In this exercise, I want to generate utility function parameters similar to those of MABM. Therefore, I filter the VISTA data to 2012-14 reporting period. Also I only focus on home-to-work trips. MABM uses home-work-home trips, I haven't filtered based on the return leg so it will generate some difference with MABM here.
+
+```{r}
+
+vistaDir <- "~/ownCloud/Data/VISTA/"
+vistaSuffix <- "_VISTA12_16_SA1_V1.csv"
+
+households <- read_csv(glue('{vistaDir}H{vistaSuffix}')) %>% 
+  dplyr::select(HHID, HHINC, HHSIZE, TRAVDATE, ADULTBIKES,
+                CARS, FOURWDS, UTES, VANS, TRUCKS)
+
+persons <- read_csv(glue('{vistaDir}P{vistaSuffix}')) %>% 
+  # joining family info
+  left_join(households,  by = "HHID") %>% 
+  # Filtering those with full license
+  filter(CARLICENCE=="Full Licence") %>% 
+  # Only including adult bikes as we care for those who can drive (ie adults)
+  filter(ADULTBIKES>1) %>%
+  # Any one with >0 four wheel motorised vehicle that counts as driving
+  filter(CARS+FOURWDS+UTES+VANS+TRUCKS >0) %>% 
+  dplyr::select(PERSID, age=AGE, sex=SEX, HHSIZE, hhInc=HHINC, TRAVDATE)
+
+trips <- read_csv(glue('{vistaDir}T{vistaSuffix}')) %>%
+  filter(PERSID %in% persons$PERSID) %>% 
+  left_join(persons, by = "PERSID") %>%
+  filter(ORIGPLACE1=="Accommodation" &
+           DESTPLACE1 %in% c("Workplace","Place of Education")) %>% 
+  # mutate(WDINC=case_when(!is.na(hhInc) ~ tripsmax(hhInc*52/(HHSIZE*240),65),
+  mutate(WDINC=case_when(!is.na(hhInc) ~ hhInc*52/(HHSIZE*240),
+                         TRUE ~ 65)) %>% 
+  mutate(WDINC=case_when(WDINC<65 ~ 65, TRUE ~ WDINC)) %>% 
+  dplyr::select(hhInc, WDINC,  CUMDIST, TRAVTIME, DEPHOUR, DEPTIME, DEPTDATE= TRAVDATE,
+                LINKMODE, HomeSA1 = ORIGSA1, WorkSA1 = DESTSA1, ORIGLGA, DESTLGA) %>%
+  mutate(DEPTIME2 = sprintf("%02d:%02d:%02d",floor(as.integer(DEPTIME)/60),(as.integer(DEPTIME)%%60),0)) %>% 
+  mutate(DEPTIME2 = as.POSIXct(DEPTIME2,format="%H:%M:%S",tz = Sys.timezone())) %>% 
+  mutate(deptDateTomorrow=DEPTIME2 +24*60*60) %>% 
+  mutate(DEPTDATE2= as.Date.character(DEPTDATE, format = "%d/%m/%Y")) %>%
+  mutate(tripYear= year(DEPTDATE2)) %>% 
+  filter(!is.na(deptDateTomorrow))
+# %>%
+  # mutate(DEPTTimePosic=  as.POSIXct(strptime(paste0(as.character(Sys.Date()+1)," ",DEPTIME2), 
+  #                                   format = "%Y-%m-%d %H:%M:%OS"), tz = "GMT")) #%>% 
+  #mutate(DUMMYDATE= as.numeric(as.POSIXct(paste0("2022-03-09",DEPTIME2)))) # Wednesday, 9 March 2022
+
+glimpse(trips)
+
+```
+
+
+```{r}
+
+vistaDir <- "~/ownCloud/Data/VISTA/"
+vistaSuffix <- "_VISTA12_16_SA1_V1.csv"
+
+households <- read_csv(glue('{vistaDir}H{vistaSuffix}')) %>% 
+  dplyr::select(HHID, HHINC, HHSIZE, TRAVDATE, ADULTBIKES,
+                CARS, FOURWDS, UTES, VANS, TRUCKS)
+
+persons2 <- read_csv(glue('{vistaDir}P{vistaSuffix}')) %>% 
+  # joining family info
+  left_join(households,  by = "HHID") %>% 
+  # Filtering those with full license
+  mutate(hasLicense=ifelse(CARLICENCE=="Full Licence", yes = "Y", no="N")) %>% 
+  # Only including adult bikes as we care for those who can drive (ie adults)
+  mutate(hasBike=ifelse(ADULTBIKES>1, yes = "Y", no="N")) %>% 
+  # Any one with >0 four wheel motorised vehicle that counts as driving
+  mutate(hasCar=ifelse((CARS+FOURWDS+UTES+VANS+TRUCKS)>0, yes = "Y", no="N")) %>% 
+  dplyr::select(PERSID, age=AGE, sex=SEX, HHSIZE, hhInc=HHINC, TRAVDATE, 
+                hasBike, hasCar, hasLicense)
+
+
+trips2 <- read_csv(glue('{vistaDir}T{vistaSuffix}')) %>%
+  filter(PERSID %in% persons2$PERSID) %>% 
+  left_join(persons, by = "PERSID") %>%
+  # mutate(WDINC=case_when(!is.na(hhInc) ~ tripsmax(hhInc*52/(HHSIZE*240),65),
+  mutate(WDINC=case_when(!is.na(hhInc) ~ hhInc*52/(HHSIZE*240),
+                         TRUE ~ 65)) %>% 
+  mutate(WDINC=case_when(WDINC<65 ~ 65, TRUE ~ WDINC)) %>% 
+  mutate(DEPTIME2 = sprintf("%02d:%02d:%02d",floor(as.integer(DEPTIME)/60),(as.integer(DEPTIME)%%60),0)) %>% 
+  mutate(DEPTIME2 = as.POSIXct(DEPTIME2,format="%H:%M:%S",tz = Sys.timezone())) %>% 
+  mutate(deptDateTomorrow=DEPTIME2 +24*60*60) %>% 
+  mutate(DEPTDATE2= as.Date.character(TRAVDATE, format = "%d/%m/%Y")) %>%
+  mutate(tripYear= year(DEPTDATE2)) %>% 
+  filter(!is.na(deptDateTomorrow))
+
+
+tripsPrimary <- trips2 %>% 
+  filter(ORIGPLACE1=="Accommodation" &
+           DESTPLACE1 %in% c("Workplace","Place of Education")) %>% 
+  dplyr::select(hhInc, WDINC,  CUMDIST, TRAVTIME, DEPHOUR, DEPTIME, DEPTDATE= TRAVDATE,
+                LINKMODE, HomeSA1 = ORIGSA1, WorkSA1 = DESTSA1, ORIGLGA, DESTLGA)
+  
+tripsSecondary <- trips2 %>% 
+  filter(ORIGPLACE1=="Accommodation" &
+           DESTPLACE1 %in% c("Social Place","Recreational Place", "Other", 
+                             "Natural Feature","Shops", "Natural Feature",
+                             "Place of Personal Business")) %>%   
+  filter(DESTPLACE2 != "Recreational NEC") %>% 
+  dplyr::select(hhInc, WDINC,  CUMDIST, TRAVTIME, DEPHOUR, DEPTIME, DEPTDATE= TRAVDATE,
+                LINKMODE, HomeSA1 = ORIGSA1, WorkSA1 = DESTSA1, ORIGLGA, DESTLGA)
+  
+
+```
+Getting 
+
+```{r}
+
+innerLGAs
+trips %>% 
+  filter(LINKMODE=="Vehicle Driver") %>% 
+  mutate(peak_hour=if_else(condition = (as.integer(DEPHOUR) %in% c(7,8,9,16,17,18) & DESTLGA=="Melbourne (C)"), true = TRUE, false = FALSE)) %>% 
+  group_by(peak_hour) %>% 
+  summarise(speed=mean(CUMDIST/(TRAVTIME/60)))
+
+(28.77-24.79)/24.79
+```
+
+## Data preparation for MNL Choice model
+
+### Filtering based on the trip modes:
+
+For the model I only conisder *car*, *pt*, *bike*,and *walk* as my modes for the choice model. I don't differentiate between different types of public transportation and I also only consider the car driver, and not the passengers, here (these assumptions might be different to MABM).  
+
+```{r Data preparation in MNL choice model required format}
+# Filtering modes to only car, pt, bike and walk
+data <- trips %>% 
+  mutate_if(is.factor, as.character) %>% 
+  #mutate(mode=if_else(LINKMODE %in% c("Vehicle Driver", "Vehicle Passenger"), true = "car", false = LINKMODE)) %>% 
+  mutate(mode=case_when(LINKMODE == "Vehicle Driver" ~ "car",
+                        LINKMODE %in% c("Train", "Tram", "Public Bus") ~ "pt",
+                        LINKMODE =="Bicycle" ~ "bike",
+                        LINKMODE =="Walking" ~ "walk",
+                        TRUE ~ "other")) %>% 
+  filter(mode!="other") %>% 
+  mutate(mode=as.factor(mode))
+
+```
+
+### Assiging coordinates to origin and destinations
+
+In order to calculate the travel times, centroids of SA1s are considered as the individuals origin and destination coordinates. 
+
+**NOTE** I have shapefiles for 2016 SA1 codes, however, VISTA 2012-16 is based on 2011 SA1 coding. Therefore, here I am matching the SA1 2011 to SA1 2016 based on a conversion file to be used later:
+
+```{r}
+
+# sa1_old <- read_csv("./sa1conversion.csv") %>% mutate_all(as.character)
+sa1s <- read_sf("~/ownCloud/Data/ABS_Boundaries/2011/SA1_2011_AUST.shp")
+  
+sa1s_transformed <- sa1s %>% 
+  st_centroid() %>% 
+  cbind(st_coordinates(.)) %>% 
+  rename(xOriginal=X, yOriginal=Y) %>% 
+  st_transform(28355) %>% 
+  cbind(st_coordinates(.)) %>% 
+  rename(xTransformed=X, yTransformed=Y) %>% 
+  st_drop_geometry() %>% 
+  # inner_join(sa1_old, by = c("SA1_MAIN16"="SA1_MAINCODE_2016")) %>%
+  distinct(SA1_MAIN11, .keep_all = T) %>% # Because some 2011 SA1 divded into multiple 2016 ones
+  dplyr::select("SA1_MAIN11","xOriginal","yOriginal", "xTransformed", "yTransformed")
+  
+data <- data %>% 
+  mutate(HomeSA1=as.character(HomeSA1),
+         WorkSA1=as.character(WorkSA1)) %>% 
+  left_join(sa1s_transformed, by = c("HomeSA1"="SA1_MAIN11"), keep=F) %>% 
+  rename(homeXOriginal = xOriginal, homeYOriginal = yOriginal, 
+         homeXTransformed = xTransformed, homeYTransformed = yTransformed) %>%
+  left_join(sa1s_transformed, by = c("WorkSA1"= "SA1_MAIN11")) %>% 
+  rename(workXOriginal = xOriginal, workYOriginal = yOriginal, 
+         workXTransformed = xTransformed, workYTransformed = yTransformed) 
+
+```
+
+### Public transportation with google transit
+
+```{r, eval=FALSE}
+if(usingPreviousTransitData==T){
+  transitData <- read_csv("DataWithTransitFromGoogleAPI.csv")
+  if(nrow(transitData)==nrow(data)){
+    data <- cbind(data, transitData)
+  }else{
+    echo("Input transit data seems incompatible")
+    stop()
+  }
+}else{
+  library(gmapsdistance)
+  set.api.key(readLines("./google.key"))
+  i=1
+  for(i in 1:nrow(data)){
+    if(i%%50 == 0) print(i)
+    route=gmapsdistance(origin = paste0(data$homeYOriginal[i],"+",data$homeXOriginal[i]),
+                        destination = paste0(data$workYOriginal[i],"+",data$workXOriginal[i]),
+                        mode = "transit",
+                        dep_date = as.character(Sys.Date()+1),
+                        dep_time =  as.character(format(with_tz(data$deptDateTomorrow[i],"GMT"),format = "%H:%M:%S"))
+                        )
+      
+      if(route$Status=="ROUTE_NOT_FOUND"){
+        data[i,"time.pt"] <- NA #CUMDIST*60/5 # if route not found, supposing it needs to walk
+        data[i,"distance.pt"] <- NA #CUMDIST*60/5 # if route not found, supposing it needs to walk
+      }else{
+        data[i,"time.pt"] <- route$Time / 60
+        data[i,"distance.pt"] <- route$Distance
+      }
+  }
+  write_csv(data, "DataWithTransitFromGoogleAPI.csv")
+}
+
+```
+
+## Other modes with google distance api
+
+```{r, eval=FALSE}
+data_ptAdded <- read_csv("./DataWithTransitFromGoogleAPI.csv")
+data_full <- data_ptAdded
+# my_datCa <- data %>% dplyr::select(-distance.car,-distance.bike,-distance.walk)
+map=c("driving"="car","walking"="walk", "bicycling"="bike")
+for(i in 1:nrow(data_full)){
+# for(i in 1:10){
+  if(i%%50 == 0) print(i)
+  # m="driving"
+  for(m in c("driving","walking","bicycling")){
+    route=gmapsdistance(origin = paste0(data_full$homeYOriginal[i],"+",data_full$homeXOriginal[i]),
+                        destination = paste0(data_full$workYOriginal[i],"+",data_full$workXOriginal[i]),
+                        mode = m,
+                        dep_date = as.character(Sys.Date()+1),
+                        dep_time =  as.character(format(with_tz(data$deptDateTomorrow[i],"GMT"),format = "%H:%M:%S"))
+                        )
+    
+    if(route$Status=="ROUTE_NOT_FOUND"){
+      data_full[i,paste0("time.",map[m])] <- NA #CUMDIST*60/5 # if route not found, supposing it needs to walk
+      data_full[i,paste0("distance.",map[m])] <- NA #CUMDIST*60/5 # if route not found, supposing it needs to walk
+    }else{
+      data_full[i,paste0("time.",map[m])] <- route$Time / 60
+      data_full[i,paste0("distance.",map[m])] <- route$Distance
+    }
+  }
+}
+
+write_csv(data_full, "FullDataWithGoogleAPI.csv")
+
+```
+
+```{r}
+dataAllModes <- read_csv("FullDataWithGoogleAPI.csv")
+```
+
+## Adding travel cost:
+
+Based on yealy rates
+
+```{r travel cost}
+
+costTable <- as.data.frame(cbind(tripYear=c(2012:2016),
+                                 fuel.price=c(1.41,1.45,1.46,1.26,1.16),
+                                 pt.price=c(2,2,2,2,2)))
+
+# costTable <- as.data.frame(cbind(tripYear=c(2012:2016),
+                                 # fuel.price=c(1.4,1.4,1.4,1.4,1.4),
+                                 # pt.price=c(3.8,3.8,3.8,3.8,3.8)))
+
+dataCostAdded <- dataAllModes %>% 
+  mutate(WDINC=if_else(WDINC<65, true = 65, false = WDINC)) %>% 
+  mutate(tripYear= year(DEPTDATE2)) %>%
+  left_join(costTable, by = "tripYear") %>% 
+  mutate(cost.car=((distance.car/1000)*(8.8017/100)*fuel.price)) %>% # fuel consumption for medium car: 8.8017 l/100km, fuel price: 144.8 c/l 
+  mutate(cost.pt=pt.price) %>% # constant cost of 4.4$. switch to zone based later
+  # mutate(cost.pt=if_else(LINKMODE=="Train" & CUMDIST>25, true = 6.5/WDINC, false = cost.pt)) %>% 
+  mutate(cost.bike=0) %>% 
+  mutate(cost.walk=0)
+```
+
+## Multinominal Logit Model Coefficients:
+
+### Preparing the data for the model
+
+```{r Using mixl}
+library(mixl)
+map=c("car"=1,"pt"=2,"walk"=3, "bike"=4)
+dataRestructured <- dataCostAdded %>% 
+  mutate(dist_walk=distance.walk/1000, 
+         dist_bike=distance.bike/1000) %>% 
+  dplyr::select(mode,starts_with("time"), starts_with("cost"), 
+                dist_walk, dist_bike, DEPHOUR)%>% 
+  rename(cost_car=cost.car, cost_pt=cost.pt) %>% 
+  mutate(time_car=time.car/60, time_pt=time.pt/60, time_bike=time.bike/60, time_walk=time.walk/60 ) %>% 
+  drop_na() %>% 
+  mutate(ID=row_number()) %>% 
+  mutate(peak_hour=if_else(condition = (as.integer(DEPHOUR) %in% c(7,8,9)), true = TRUE, false = FALSE)) %>% 
+  mutate(time_pt=if_else(peak_hour, true = time_pt, false = time_pt)) %>%
+  mutate(time_car=if_else(peak_hour, true = time_car*2, false = 1.2*time_car)) %>% # I am reducing PT time since due to COVID19 the service frequency has been significanly declined
+  mutate(CHOICE= map[mode]) %>% 
+  dplyr::select(ID,cost_car, cost_pt, dist_walk, dist_bike, time_car, 
+                time_pt, time_bike, time_walk, CHOICE)
+```
+
+### Specifing the model
+
+```{r}
+
+mnl_test <- "
+	U_car =   + @B_money    * $cost_car + @B_timeCar * $time_car;
+	U_pt =   @ASC_pt   + @B_money    * $cost_pt  + @B_timePT  * $time_pt;
+	U_walk = @ASC_walk + @B_timeWalk * $time_walk;
+	U_bike = @ASC_bike + @B_timeBike * $time_bike;
+	"
+
+model_spec <- mixl::specify_model(mnl_test, dataRestructured, disable_multicore=F)
+```
+
+
+```{r}
+
+est <- stats::setNames(c(1,
+                        1,1,1,
+                        1,1,1,1), 
+                       c("B_money", 
+                         "ASC_pt"   , "ASC_walk"   , "ASC_bike"  , 
+                         "B_timeCar", "B_timePT" , "B_timeWalk" , "B_timeBike"))
+
+availabilities <- mixl::generate_default_availabilities(dataRestructured, model_spec$num_utility_functions)
+
+log <- capture.output({
+model <- mixl::estimate(model_spec, est, dataRestructured, availabilities = availabilities)
+})
+
+mixl::summary_tex(summary(model))
+# summary(model)
+```
+
+### Converting estimates to MATSim expected values:
+
+```{r}
+estimates <- model$estimate %>% 
+  as.data.frame() %>% 
+  rownames_to_column()
+
+colnames(estimates) <- c("Coeff", "Value")
+print(estimates)
+```
+
+Getting the car trav time coefficient
+
+```{r}
+carCoeff <- estimates[which(estimates$Coeff=="B_timeCar"),"Value"]
+```
+
+setting car travel time to zero and adjust rest accordingly
+
+```{r}
+
+travTimeCoefRows <- which(estimates$Coeff%in%c("B_timeCar" ,"B_timePT" ,
+                                               "B_timeWalk", "B_timeBike"))
+estimatesAdjusted <- estimates
+estimatesAdjusted[travTimeCoefRows,"Value"] <- estimates[travTimeCoefRows,"Value"]-carCoeff
+
+```
+
+Getting monetary distance rate for car (per m) based on 2018 average fuel price of 
+143.4 in Vic
+
+https://www.racv.com.au/on-the-road/buying-a-car/car-running-costs.html#fundamentals
+
+```{r}
+# Only fuel cost
+# monetaryDistanceRate_Car=-(1)*(1/1000)*(8.8017/100)*1.43
+# Cost of owning
+monetaryDistanceRate_Car=-(70.8)*(1/1000)*(1/100)
+```
+
+https://www.ptv.vic.gov.au/news-and-events/news/2017/12/15/annual-fare-adjustment-for-2018/ for daily myke fare
+
+```{r}
+dailyMonetaryConstant_PT=-8.60
+```
+
+For PT fares, the assumption is 
+
+```{r}
+estimatesAdjusted %>% rbind(
+  tibble(Coeff="Performing", Value=-carCoeff),
+  tibble(Coeff="lateArrival", Value=3*carCoeff),
+  tibble(Coeff="waitingPt", Value=2*carCoeff),
+  tibble(Coeff="monetaryDistanceRate_Car", Value=monetaryDistanceRate_Car),
+  tibble(Coeff="dailyMonetaryConstant_PT", Value=dailyMonetaryConstant_PT)
+)
+```
+
+
